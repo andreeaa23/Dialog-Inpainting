@@ -3,3 +3,8 @@ flask
 flask-cors
 wikipedia-api
 python-dotenv
+pymongo
+bcrypt
+passlib
+flask-jwt-extended
+DateTime
