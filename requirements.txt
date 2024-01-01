@@ -1,0 +1,5 @@
+google-cloud-language
+flask
+flask-cors
+wikipedia-api
+python-dotenv
