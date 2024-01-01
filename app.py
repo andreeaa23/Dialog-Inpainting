@@ -1,135 +1,183 @@
+from flask_jwt_extended import create_access_token, JWTManager, jwt_required, get_jwt_identity
+from google.cloud import language_v1
+from flask import request, jsonify, Flask
+from flask_cors import CORS
 import wikipediaapi
-import spacy
-import nltk, nltk.data
-from nltk import tokenize, word_tokenize
-from sklearn.feature_extraction.text import TfidfVectorizer
+from dotenv import load_dotenv
+import json
+import re
+import os
+from pymongo import MongoClient
+from passlib.hash import bcrypt
+from datetime import timedelta
+from bson import ObjectId
 
+### activare env: Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -> licenta\Scripts\Activate
 
-nlp = spacy.load("en_core_web_sm") #English model language
-#nltk.download('punkt')
+#Incarcare .env
+load_dotenv()
 
-def extractContentAsSentences(pageTitle):
-    try:
-        # Create a Wikipedia API object
-        wiki_wiki = wikipediaapi.Wikipedia(
-            language = "en",
-            user_agent = "dialog inpainting")
+app = Flask("DialogInpainting")
+CORS(app)
+
+# Conectare MongoDB
+client = MongoClient(os.getenv("MONGO_URI"))
+db = client[os.getenv("DB_NAME")]
+collection = db.get_collection(os.getenv("DB_COLLECTION_NAME"))
+
+# Setari JWT
+jwt = JWTManager(app)
+secret_key = os.getenv("SECRET_KEY")
+app.config['JWT_SECRET_KEY'] = secret_key
+
+try:
+    server_info = client.server_info()
+    print("Connected to MongoDB, version: ", server_info['version'])
+except Exception as e:
+    print("Could not connect to MongoDB: %s" % e)
+    
+@app.route('/register', methods=['POST'])
+def register():
+    # Preluare date din request
+    data = request.get_json()
+    email = data.get('email')
+    username = data.get('username')
+    password = data.get('password')
+
+    if collection.find_one({"username": username}):
+        return jsonify({"message": "Numele de utilizator există deja!"}), 400
+    elif collection.find_one({"email": email}):
+        return jsonify({"message": "Email-ul există deja!"}), 400
+    else:
+        hashed_password = bcrypt.hash(password)
+        collection.insert_one({"email": email, "username": username, "password": hashed_password})
+        return jsonify({"message": "Registration successful"}), 201
+
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.get_json()
+    username = data.get('username')
+    password = data.get('password')
+    
+    user = collection.find_one({"username": username})
+
+    if not user:
+        return jsonify({"message": "Nume utilizator invalid sau parolă invalidă!"}), 401
+
+    if bcrypt.verify(password.encode('utf-8'), user["password"]):
+        access_token = create_access_token(identity=str(user["_id"]), expires_delta=timedelta(days=7)) # ObjectId isn't JSON serializable
+        return jsonify({"message": "Login successful", "access_token": access_token}), 200
+    else:
+        return jsonify({"message": "Nume utilizator invalid sau parolă invalidă!"}), 401
+    
+@app.route('/change-password', methods=['POST'])
+@jwt_required()
+def change_password():
+    current_user = get_jwt_identity()
+
+    new_password = request.json.get('password')
+    user = collection.find_one({"_id": ObjectId(current_user)})
+    
+    if not user:
+        return jsonify({'error': 'Utilizatorul nu există.'}), 404
+
+    # Schimbare parola 
+    user['password'] = bcrypt.hash(new_password)
+
+    # Salvarea in BD
+    collection.update_one({"_id": ObjectId(current_user)}, {'$set': user})
+    
+    return jsonify({'message': 'Parola a fost schimbată cu succes!'})
+
+@app.route('/getContent', methods=['GET'])
+@jwt_required()
+# Pas 1: Extragere continut articol de pe Wikipedia
+def get_wikipedia_content():
+    data = request.get_json()
+    page_title = data.get('page_title')
+    
+    wiki_wiki = wikipediaapi.Wikipedia(
+        language="en",
+        user_agent="dialog inpainting")
+
+    page = wiki_wiki.page(page_title)
+    if page.exists():
+        content = page.text
+    else:
+        print(f"The page '{page_title}' does not exist on Wikipedia.")
         
-        page = wiki_wiki.page(pageTitle)
+    with open(os.getenv("API_KEY_PATH"), "r") as json_file:
+        api_key_data = json.load(json_file)
 
-        content_copy = ""
-        if page.exists():
-            content = page.text
+    client = language_v1.LanguageServiceClient.from_service_account_info(
+    api_key_data)
 
-            lines = content.split('\n') 
-            for line in lines:
-                if "See also" in line:
-                    break  
-                if line.strip().endswith('.') and line.strip()[0].isupper():
-                    content_copy += line + '\n'
-        else:
-            print(f"The page '{pageTitle}' does not exist on Wikipedia.")
-        
-        return content_copy
+    document = language_v1.Document(
+    content=content, type_=language_v1.Document.Type.PLAIN_TEXT)
+
+    # Enable syntax analysis for sentence splitting
+    features = {"extract_syntax": True, "extract_entities": False,
+                "extract_document_sentiment": False, "extract_entity_sentiment": False, "classify_text": False}
+
+    response = client.annotate_text(document=document, features=features)
+
+    sentences = [sentence.text.content.strip() for sentence in response.sentences if re.match(r'^[A-Z].*\.$', sentence.text.content)]
     
-    except Exception as e:
-        return f"An error occurred: {str(e)}"
-        
-def extractiveSummarization(sentences): #extractive summarization = identif prop importante si extragerea lor in forma originala
+    result = []
     
-    num_sentences = int(len(sentences) / 3)
-
-    # Create TF-IDF vectorizer
-    vectorizer = TfidfVectorizer()
-
-    # Compute TF-IDF scores for each sentence
-    tfidf_matrix = vectorizer.fit_transform(sentences)
-    tfidf_scores = tfidf_matrix.toarray().sum(axis=1)
-
-    # Get the indices of the top sentences based on TF-IDF scores
-    top_sentence_indices = tfidf_scores.argsort(axis=0)[-num_sentences:]
-    top_sentence_indices = top_sentence_indices.flatten()
+    for paragraph in sentences:
+        paragraph_sentences = paragraph.split('\n')
+        num_sentences = min(6, len(paragraph_sentences))
+        #result.append("\n".join(paragraph_sentences[:num_sentences]))
+        # If the paragraph has fewer than six sentences, print all sentences
+        if num_sentences < 6:
+            result.append("\n".join(paragraph_sentences[:num_sentences]))
     
- # Convert indices to integers
-    top_sentence_indices = [int(index) for index in top_sentence_indices]
-    
-    # Sort the indices and select the top sentences
-    top_sentence_indices = sorted(top_sentence_indices)
-    
-    # Ensure the first sentence is always in the summary
-    if 0 not in top_sentence_indices:
-        top_sentence_indices.insert(0, 0)
-    if 1 not in top_sentence_indices:
-        top_sentence_indices.insert(1, 1)
-        
-        
-    top_sentences = [sentences[i] for i in top_sentence_indices]
+    return jsonify(result)
 
-    return ' '.join(top_sentences)
-    
-    
-def tokenize_sentences(sentences):
-    tokens = sentences.split(".\n")
-    return tokens
+# Pas 2: Parsare paragrafe in propozitii folosin Google Cloud Natural Language API
+def split_into_sentences(content, api_key_path):
+    with open(api_key_path, "r") as json_file:
+        api_key_data = json.load(json_file)
 
-def sumarizare(text):
-    doc = nlp(text)
+    client = language_v1.LanguageServiceClient.from_service_account_info(
+        api_key_data)
 
-    STOP_WORDS = set(text.split())
-    word_weights={}
+    document = language_v1.Document(
+        content=content, type_=language_v1.Document.Type.PLAIN_TEXT)
 
-    for ent in doc.ents:
-        ent_text = ent.text.lower()
-        if ent_text in word_weights:
-            word_weights[ent_text] += 1
-        else:
-            word_weights[ent_text] = 1
+    # Enable syntax analysis for sentence splitting
+    features = {"extract_syntax": True, "extract_entities": False,
+                "extract_document_sentiment": False, "extract_entity_sentiment": False, "classify_text": False}
 
-    for word in word_tokenize(text):
-        word = word.lower()
-        if len(word) > 1 and word not in STOP_WORDS:
-            if word in word_weights.keys():            
-                word_weights[word] += 1
-            else:
-                word_weights[word] = 1
+    response = client.annotate_text(document=document, features=features)
 
-    sentence_weights={}
-    sentences = tokenize.sent_tokenize(text)
-    no_sentences = int(len(sentences)/2)
-    for sent in sentences:
-        sentence_weights[sent] = 0
-        sent_words = word_tokenize(sent)
-        sent_entities = [ent.text.lower() for ent in doc.ents]
-        for word in sent_words:
-            word = word.lower()
-            if word in word_weights:
-                sentence_weights[sent] += word_weights[word]
-            if word in sent_entities:
-                sentence_weights[sent] += 1
-    
-    highest_weights = sorted(sentence_weights.values())[-no_sentences:]
+    sentences = [sentence.text.content.strip() for sentence in response.sentences if re.match(
+        r'^[A-Z].*\.$', sentence.text.content)]
 
-    summary=""
-    for sentence,strength in sentence_weights.items():  
-        if strength in highest_weights:
-            summary += sentence + " "
-    summary = summary.replace('_', ' ').strip()
-    
-    return summary
+    return sentences
+
+
+# Pas 3: Afisarea primelor 6 prop din fiecare paragraf
+def print_first_six_sentences(sentences):
+    # for paragraph in sentences:
+    #     paragraph_sentences = paragraph.split('\n')[:6]
+    #     print("\n".join(paragraph_sentences))
+    #     # print("\n")
+    for paragraph in sentences:
+        paragraph_sentences = paragraph.split('\n')
+        num_sentences = min(6, len(paragraph_sentences))
+        print("\n".join(paragraph_sentences[:num_sentences]))
+        # If the paragraph has fewer than six sentences, print all sentences
+        if num_sentences < 6:
+            print("\n".join(paragraph_sentences[num_sentences:]))
+        print("\n")
+
 
 if __name__ == "__main__":
-    articleTitle = input("Enter the Wikipedia article title: ")
-    print("\n")
-    sentences = extractContentAsSentences(articleTitle)
+    article_title = input("Enter the Wikipedia article title: ")
+    wikipedia_content = get_wikipedia_content(article_title)
 
-    # for sent in sentences:
-    #print(sentences)
-    #tokens = tokenize_sentences(sentences)
-   # print(tokens)
-   
-    #summary = extractiveSummarization(tokens)
-    summary = sumarizare(sentences)
-    print(summary)
-        
-
-
+    sentences = split_into_sentences(
+        wikipedia_content, api_key_path=os.getenv("API_KEY_PATH"))
+    print_first_six_sentences(sentences)
