@@ -128,7 +128,7 @@ def get_wikipedia_content():
     for paragraph in sentences:
         paragraph_sentences = paragraph.split('\n')
         num_sentences = min(6, len(paragraph_sentences))
-        #result.append("\n".join(paragraph_sentences[:num_sentences]))
+
         # If the paragraph has fewer than six sentences, print all sentences
         if num_sentences < 6:
             result.append("\n".join(paragraph_sentences[:num_sentences]))
