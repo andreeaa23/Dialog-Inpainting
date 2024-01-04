@@ -106,6 +106,7 @@ def get_wikipedia_content():
     else:
         print(f"The page '{page_title}' does not exist on Wikipedia.")
         
+            
     with open(os.getenv("API_KEY_PATH"), "r") as json_file:
         api_key_data = json.load(json_file)
 
@@ -122,7 +123,7 @@ def get_wikipedia_content():
     response = client.annotate_text(document=document, features=features)
 
     sentences = [sentence.text.content.strip() for sentence in response.sentences if re.match(r'^[A-Z].*\.$', sentence.text.content)]
-    
+
     result = []
     
     for paragraph in sentences:
