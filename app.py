@@ -38,7 +38,6 @@ except Exception as e:
     
 @app.route('/register', methods=['POST'])
 def register():
-    # Preluare date din request
     data = request.get_json()
     email = data.get('email')
     username = data.get('username')
@@ -62,13 +61,13 @@ def login():
     user = collection.find_one({"username": username})
 
     if not user:
-        return jsonify({"message": "Nume utilizator invalid sau parolă invalidă!"}), 401
+        return jsonify({"message": "Invalid username or password!"}), 401
 
     if bcrypt.verify(password.encode('utf-8'), user["password"]):
         access_token = create_access_token(identity=str(user["_id"]), expires_delta=timedelta(days=7)) # ObjectId isn't JSON serializable
         return jsonify({"message": "Login successful", "access_token": access_token}), 200
     else:
-        return jsonify({"message": "Nume utilizator invalid sau parolă invalidă!"}), 401
+        return jsonify({"message": "Invalid username or password!"}), 401
     
 @app.route('/change-password', methods=['POST'])
 @jwt_required()
@@ -79,7 +78,7 @@ def change_password():
     user = collection.find_one({"_id": ObjectId(current_user)})
     
     if not user:
-        return jsonify({'error': 'Utilizatorul nu există.'}), 404
+        return jsonify({'error': 'The user does not exist!'}), 404
 
     # Schimbare parola 
     user['password'] = bcrypt.hash(new_password)
@@ -87,14 +86,15 @@ def change_password():
     # Salvarea in BD
     collection.update_one({"_id": ObjectId(current_user)}, {'$set': user})
     
-    return jsonify({'message': 'Parola a fost schimbată cu succes!'})
+    return jsonify({'message': 'Password changed successfully!'})
 
 @app.route('/getContent', methods=['GET'])
 @jwt_required()
 # Pas 1: Extragere continut articol de pe Wikipedia
 def get_wikipedia_content():
-    data = request.get_json()
-    page_title = data.get('page_title')
+    # data = request.get_json()
+    # page_title = data.get('page_title')
+    page_title = request.args.get('page_title')
     
     wiki_wiki = wikipediaapi.Wikipedia(
         language="en",
@@ -104,7 +104,7 @@ def get_wikipedia_content():
     if page.exists():
         content = page.text
     else:
-        print(f"The page '{page_title}' does not exist on Wikipedia.")
+        print(f"The page '{page_title}' does not exist on Wikipedia!")
         
             
     with open(os.getenv("API_KEY_PATH"), "r") as json_file:
@@ -177,10 +177,3 @@ def print_first_six_sentences(sentences):
         print("\n")
 
 
-if __name__ == "__main__":
-    article_title = input("Enter the Wikipedia article title: ")
-    wikipedia_content = get_wikipedia_content(article_title)
-
-    sentences = split_into_sentences(
-        wikipedia_content, api_key_path=os.getenv("API_KEY_PATH"))
-    print_first_six_sentences(sentences)
