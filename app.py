@@ -19,6 +19,7 @@ load_dotenv()
 
 app = Flask("DialogInpainting")
 CORS(app)
+# CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 # Conectare MongoDB
 client = MongoClient(os.getenv("MONGO_URI"))
@@ -69,10 +70,48 @@ def login():
     else:
         return jsonify({"message": "Invalid username or password!"}), 401
     
+@app.route('/addTitle', methods=['POST'])
+@jwt_required()
+def add_searched_title():
+    current_user = get_jwt_identity()
+    titles = request.json.get('titles') # Assume 'titles' is a list of titles
+    
+    if not titles:
+        return jsonify({"message": "No titles provided"}), 400
+    
+    # Find the user document using the current_user ID and update it
+    result = collection.update_one(
+        {"_id": ObjectId(current_user)},{"$addToSet": {"searched_titles": {"$each": titles}}},  # Use $addToSet with $each to add titles without duplication
+        upsert=True  # If the document doesn't exist, create it
+    )
+
+    if result.modified_count > 0:
+        return jsonify({"message": "Titles added successfully"}), 200
+    else:
+        return jsonify({"message": "Failed to add titles"}), 500
+    
+@app.route('/getTitles', methods=['GET'])
+@jwt_required()
+def get_titles():
+    current_user = get_jwt_identity()
+    
+    # Find the user document using the current_user ID
+    user = collection.find_one({"_id": ObjectId(current_user)})
+    
+    # Check if the user document has the 'searched_titles' field
+    if user and 'searched_titles' in user:
+        return jsonify({"titles": user['searched_titles']}), 200
+    elif user:
+        # The user exists but has no titles added yet
+        return jsonify({"titles": []}), 200
+    else:
+        # User document not found
+        return jsonify({"message": "User not found"}), 404
+    
 @app.route('/change-password', methods=['POST'])
 @jwt_required()
 def change_password():
-    current_user = get_jwt_identity()
+    current_user = get_jwt_identity() # userul curent
 
     new_password = request.json.get('password')
     user = collection.find_one({"_id": ObjectId(current_user)})
@@ -90,12 +129,10 @@ def change_password():
 
 @app.route('/getContent', methods=['GET'])
 @jwt_required()
-# Pas 1: Extragere continut articol de pe Wikipedia
 def get_wikipedia_content():
-    # data = request.get_json()
-    # page_title = data.get('page_title')
+    # Pas 1: Extragere continut articol de pe Wikipedia
     page_title = request.args.get('page_title')
-    
+
     wiki_wiki = wikipediaapi.Wikipedia(
         language="en",
         user_agent="dialog inpainting")
@@ -106,7 +143,7 @@ def get_wikipedia_content():
     else:
         print(f"The page '{page_title}' does not exist on Wikipedia!")
         
-            
+    # Pas 2: Parsare paragrafe in propozitii folosin Google Cloud Natural Language API
     with open(os.getenv("API_KEY_PATH"), "r") as json_file:
         api_key_data = json.load(json_file)
 
@@ -116,7 +153,6 @@ def get_wikipedia_content():
     document = language_v1.Document(
     content=content, type_=language_v1.Document.Type.PLAIN_TEXT)
 
-    # Enable syntax analysis for sentence splitting
     features = {"extract_syntax": True, "extract_entities": False,
                 "extract_document_sentiment": False, "extract_entity_sentiment": False, "classify_text": False}
 
@@ -125,9 +161,9 @@ def get_wikipedia_content():
     #sentences = [sentence.text.content.strip() for sentence in response.sentences if re.match(r'^[A-Z].*\.$', sentence.text.content)]
     sentences = [sentence.text.content.strip() for sentence in response.sentences if re.match(r'^[A-Z].*\s[A-Za-z0-9]{2,}\.$', sentence.text.content)]
 
-
     result = []
     
+    # Pas 3: Alegerea primelor 6 prop din fiecare paragraf
     for paragraph in sentences:
         paragraph_sentences = paragraph.split('\n')
         num_sentences = min(6, len(paragraph_sentences))
@@ -136,7 +172,7 @@ def get_wikipedia_content():
         if num_sentences < 6:
             result.append("\n".join(paragraph_sentences[:num_sentences]))
     
-    return jsonify(result)
+    return jsonify(result) #return resul of an array of phrases
 
 # Pas 2: Parsare paragrafe in propozitii folosin Google Cloud Natural Language API
 def split_into_sentences(content, api_key_path):
@@ -159,7 +195,6 @@ def split_into_sentences(content, api_key_path):
         r'^[A-Z].*\.$', sentence.text.content)]
 
     return sentences
-
 
 # Pas 3: Afisarea primelor 6 prop din fiecare paragraf
 def print_first_six_sentences(sentences):
