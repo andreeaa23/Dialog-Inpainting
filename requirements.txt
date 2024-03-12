@@ -8,3 +8,10 @@ bcrypt
 passlib
 flask-jwt-extended
 DateTime
+torch
+torchvision
+tochaudio
+transformers
+sentencepiece
+evaluate
+rouge

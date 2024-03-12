@@ -22,7 +22,9 @@ CORS(app)
 # CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 # Conectare MongoDB
-client = MongoClient(os.getenv("MONGO_URI"))
+#client = MongoClient(os.getenv("MONGO_URI"))
+client = MongoClient("mongodb+srv://andreea23:admin@licenta.dulxhyq.mongodb.net/?retryWrites=true&w=majority")
+print(client)
 db = client[os.getenv("DB_NAME")]
 collection = db.get_collection(os.getenv("DB_COLLECTION_NAME"))
 
@@ -174,41 +176,74 @@ def get_wikipedia_content():
     
     return jsonify(result) #return resul of an array of phrases
 
-# Pas 2: Parsare paragrafe in propozitii folosin Google Cloud Natural Language API
-def split_into_sentences(content, api_key_path):
-    with open(api_key_path, "r") as json_file:
+
+@app.route('/getSummary', methods=['GET'])
+@jwt_required()
+def get_wikipedia_summary(): #ar merge o sumarizare extractiva aici
+    # Pas 1: Extragere continut articol de pe Wikipedia
+    page_title = request.args.get('page_title')
+
+    wiki_wiki = wikipediaapi.Wikipedia(
+        language="en",
+        user_agent="dialog inpainting")
+
+    page = wiki_wiki.page(page_title)
+    if page.exists():
+        content = page.text
+    else:
+        print(f"The page '{page_title}' does not exist on Wikipedia!")
+        
+    # Pas 2: Parsare paragrafe in propozitii folosin Google Cloud Natural Language API
+    with open(os.getenv("API_KEY_PATH"), "r") as json_file:
         api_key_data = json.load(json_file)
 
     client = language_v1.LanguageServiceClient.from_service_account_info(
-        api_key_data)
+    api_key_data)
 
     document = language_v1.Document(
-        content=content, type_=language_v1.Document.Type.PLAIN_TEXT)
+    content=content, type_=language_v1.Document.Type.PLAIN_TEXT)
 
-    # Enable syntax analysis for sentence splitting
     features = {"extract_syntax": True, "extract_entities": False,
                 "extract_document_sentiment": False, "extract_entity_sentiment": False, "classify_text": False}
 
     response = client.annotate_text(document=document, features=features)
 
-    sentences = [sentence.text.content.strip() for sentence in response.sentences if re.match(
-        r'^[A-Z].*\.$', sentence.text.content)]
+    #sentences = [sentence.text.content.strip() for sentence in response.sentences if re.match(r'^[A-Z].*\.$', sentence.text.content)]
+    sentences = [sentence.text.content.strip() for sentence in response.sentences if re.match(r'^[A-Z].*\s[A-Za-z0-9]{2,}\.$', sentence.text.content)]
 
-    return sentences
+    result = []
+    sentence_count = 0
+    
+    # Pas 3: Alegerea primelor 6 prop din fiecare paragraf
+    for sentence in sentences:
+        if sentence_count < 10:
+            result.append(sentence)
+            sentence_count += 1
+        else:
+            break  # Stop the loop if we've added 10 sentences
+    
+    return jsonify(result) 
 
-# Pas 3: Afisarea primelor 6 prop din fiecare paragraf
-def print_first_six_sentences(sentences):
-    # for paragraph in sentences:
-    #     paragraph_sentences = paragraph.split('\n')[:6]
-    #     print("\n".join(paragraph_sentences))
-    #     # print("\n")
-    for paragraph in sentences:
-        paragraph_sentences = paragraph.split('\n')
-        num_sentences = min(6, len(paragraph_sentences))
-        print("\n".join(paragraph_sentences[:num_sentences]))
-        # If the paragraph has fewer than six sentences, print all sentences
-        if num_sentences < 6:
-            print("\n".join(paragraph_sentences[num_sentences:]))
-        print("\n")
+@app.route('/deleteTitle', methods=['POST'])
+@jwt_required()
+def delete_title():
+    current_user_id = get_jwt_identity()
+    data = request.get_json()
+
+    title_to_delete = data.get('title')
+    if not title_to_delete:
+        return jsonify({"error": "Title is required"}), 400
+
+    # Assuming your user's document contains a field 'searched_titles' which is a list of titles
+    result = collection.update_one(
+        {"_id": ObjectId(current_user_id)},
+        {"$pull": {"searched_titles": title_to_delete}}  # $pull operator removes from an existing array all instances of a value or values that match a specified condition
+    )
+
+    if result.modified_count > 0:
+        return jsonify({"message": "Title deleted successfully"}), 200
+    else:
+        # This could happen if the title wasn't in the user's list or the user document couldn't be found
+        return jsonify({"error": "Failed to delete title"}), 500
 
 

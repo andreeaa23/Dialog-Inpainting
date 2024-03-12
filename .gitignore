@@ -6,3 +6,7 @@ licenta-405018-fbc2372df9dc.json
 hug.py
 app_spacy.py
 dialog_inpainting.pdf
+train_squad.parquet
+train-v2.0.json
+OR_QuAC.txt
+model.py
