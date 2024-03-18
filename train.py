@@ -20,7 +20,8 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 ######################################## Create dataset ##############################################3
   
-pd.options.display.max_rows , pd.options.display.max_columns  = 100, 100  
+pd.options.display.max_rows = 100
+pd.options.display.max_columns  = 100  
 
 # def create_pandas_dataset(data, answer_threshold=7, verbose = False):
 
@@ -73,6 +74,7 @@ t5_model = T5ForConditionalGeneration.from_pretrained('t5-small')
 
 class QuestionGenerationDataset(Dataset):
     def __init__(self, tokenizer, file_path, max_len_inp=512, max_len_out=96):
+        self.tokenizer = tokenizer
         self.path = file_path
         self.passage_column = "context"
         self.answer = "answer"
@@ -82,17 +84,17 @@ class QuestionGenerationDataset(Dataset):
         self.data = pd.read_parquet(self.path)
         self.data = self.data[self.data[self.is_answerable] == True].reset_index(drop=True).iloc[:2000, :] # get only answerable questions
 
-        self.max_len_input = max_len_inp
-        self.max_len_output = max_len_out
-        self.tokenizer = tokenizer
         self.inputs = []
         self.targets = []
+        self.max_len_input = max_len_inp
+        self.max_len_output = max_len_out
+        
         self._build()
 
     def __len__(self):
-        return len(self.inputs)
+        return len(self.inputs)  #return the number of samples from the dataset
 
-    def __getitem__(self, index):
+    def __getitem__(self, index): #return the item from an index
         source_ids = self.inputs[index]["input_ids"].squeeze()
         target_ids = self.targets[index]["input_ids"].squeeze()
 
@@ -116,6 +118,7 @@ class QuestionGenerationDataset(Dataset):
                 [input_], max_length=self.max_len_input,padding='max_length',
                 truncation = True,return_tensors="pt"
             )
+            
             # tokenize targets
             tokenized_targets = self.tokenizer.batch_encode_plus(
                 [target], max_length=self.max_len_output,padding='max_length',
@@ -126,15 +129,16 @@ class QuestionGenerationDataset(Dataset):
             self.inputs.append(tokenized_inputs)
             self.targets.append(tokenized_targets)
             
-train_path = 'train_squad_v2.parquet' # change this accordingly
+train_path = 'train_squad_v2.parquet'
 validation_path = 'validation_squad_v2.parquet'
+
 train_dataset = QuestionGenerationDataset(t5_tokenizer, train_path)
 validation_dataset = QuestionGenerationDataset(t5_tokenizer, validation_path)
 
 # Data Sample
-train_sample = train_dataset[100] # thanks to __getitem__
-decoded_train_input = t5_tokenizer.decode(train_sample['source_ids'])
-decoded_train_output = t5_tokenizer.decode(train_sample['target_ids'])
+# train_sample = train_dataset[100] # thanks to __getitem__
+# decoded_train_input = t5_tokenizer.decode(train_sample['source_ids'])
+# decoded_train_output = t5_tokenizer.decode(train_sample['target_ids'])
 
 # print(decoded_train_input)
 # print(decoded_train_output)
@@ -143,11 +147,11 @@ decoded_train_output = t5_tokenizer.decode(train_sample['target_ids'])
 # # #################################### Fine Tunning T5 ##################################
 class T5Tuner(pl.LightningModule):
 
-    def __init__(self, t5model, t5tokenizer, batchsize=4):
+    def __init__(self, t5_model, t5_tokenizer, batch_size=4):
         super().__init__()
-        self.model = t5model
-        self.tokenizer = t5tokenizer
-        self.batch_size = batchsize
+        self.model = t5_model
+        self.tokenizer = t5_tokenizer
+        self.batch_size = batch_size
 
     def forward(self, input_ids, attention_mask=None, decoder_attention_mask=None, lm_labels=None):
          outputs = self.model(
@@ -169,6 +173,7 @@ class T5Tuner(pl.LightningModule):
 
         loss = outputs[0]
         self.log('train_loss',loss)
+        
         return loss
 
     def validation_step(self, batch):
@@ -181,12 +186,13 @@ class T5Tuner(pl.LightningModule):
 
         loss = outputs[0]
         self.log("val_loss",loss)
+        
         return loss
 
     def train_dataloader(self):
         return DataLoader(train_dataset, batch_size=self.batch_size, num_workers=2)
 
-    def val_dataloader(self):
+    def validation_dataloader(self):
         return DataLoader(validation_dataset, batch_size=self.batch_size, num_workers=2)
 
     def configure_optimizers(self):
@@ -194,8 +200,8 @@ class T5Tuner(pl.LightningModule):
         # return optimizer
         optimizer = AdamW(self.parameters(), lr=3e-4, eps=1e-8)
         scheduler = get_linear_schedule_with_warmup(optimizer, 
-                                                num_warmup_steps=0,  # Adjust as per requirement
-                                                num_training_steps=self.trainer.estimated_stepping_batches)  # PyTorch Lightning provides this
+                                                num_warmup_steps=0,  
+                                                num_training_steps=self.trainer.estimated_stepping_batches)  
         scheduler_config = {
         'scheduler': scheduler,
         'interval': 'step',
@@ -207,49 +213,7 @@ model = T5Tuner(t5_model, t5_tokenizer)
 trainer = pl.Trainer(max_epochs=4, accelerator='cuda')
 trainer.fit(model)
 
-# saving the model
+# Save the model
 model.model.save_pretrained('t5_trained_model2')
 t5_tokenizer.save_pretrained('t5_tokenizer2')
 
-
-# #################### Inference/Predictions ##########################3
-trained_model_path = 't5_trained_model2'
-trained_tokenizer = 't5_tokenizer2'
-device = 'cuda' 
-
-model = T5ForConditionalGeneration.from_pretrained(trained_model_path)
-tokenizer = T5Tokenizer.from_pretrained(trained_tokenizer)
-
-model = model.to(device)
-
-# Text sample
-context ="President Donald Trump said and predicted that some states would reopen this month."
-answer = "Donald Trump"
-text = "context: "+context + " " + "answer: " + answer
-print(text)
-
-context ="Since its topping out in 2013, One World Trade Center in New York City has been the tallest skyscraper in the United States."
-answer = "World Trade Center"
-text = "context: " + context + " " + "answer: " + answer
-print(text)
-
-encoding = tokenizer.encode_plus(text,max_length =512,padding='max_length', truncation = True,return_tensors="pt")
-print (encoding.keys())
-
-input_ids = encoding["input_ids"].to(device)
-attention_mask = encoding["attention_mask"].to(device)
-
-model.eval()
-beam_outputs = model.generate(
-    input_ids=input_ids,
-    attention_mask=attention_mask,
-    max_length=72, # How long the generated questions should be
-    early_stopping=True,
-    num_beams=5,
-    num_return_sequences=2
-)
-
-# Decoding and printing out the generated sequences
-for beam_output in beam_outputs:
-    sent = tokenizer.decode(beam_output, skip_special_tokens=True, clean_up_tokenization_spaces=True)
-    print(sent)
