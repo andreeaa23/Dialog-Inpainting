@@ -10,3 +10,7 @@ train_squad.parquet
 train-v2.0.json
 OR_QuAC.txt
 model.py
+masked_train_quac.parquet
+masked_validation_quad.parquet
+validation_quac.parquet
+train_quac.parquet
