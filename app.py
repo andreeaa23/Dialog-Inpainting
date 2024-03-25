@@ -1,25 +1,31 @@
 from flask_jwt_extended import create_access_token, JWTManager, jwt_required, get_jwt_identity
 from google.cloud import language_v1
 from flask import request, jsonify, Flask
-from flask_cors import CORS
-import wikipediaapi
-from dotenv import load_dotenv
-import json
-import re
-import os
+from nltk import tokenize, word_tokenize
+from pymongo import ReturnDocument
 from pymongo import MongoClient
+from dotenv import load_dotenv
+from collections import Counter
 from passlib.hash import bcrypt
 from datetime import timedelta
+from flask_cors import CORS
 from bson import ObjectId
+import wikipediaapi
+import nltk
+import spacy
+import json
+import torch
+import re
+import os
 
 ### activare env: Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -> licenta\Scripts\Activate
 
 #Incarcare .env
 load_dotenv()
+nlp = spacy.load("en_core_web_md") #English model language
 
 app = Flask("DialogInpainting")
 CORS(app)
-# CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 # Conectare MongoDB
 #client = MongoClient(os.getenv("MONGO_URI"))
@@ -76,19 +82,20 @@ def login():
 @jwt_required()
 def add_searched_title():
     current_user = get_jwt_identity()
-    titles = request.json.get('titles') # Assume 'titles' is a list of titles
+    titles = request.json.get('titles')
     
     if not titles:
         return jsonify({"message": "No titles provided"}), 400
-    
-    # Find the user document using the current_user ID and update it
-    result = collection.update_one(
-        {"_id": ObjectId(current_user)},{"$addToSet": {"searched_titles": {"$each": titles}}},  # Use $addToSet with $each to add titles without duplication
-        upsert=True  # If the document doesn't exist, create it
+
+    updated_document = collection.find_one_and_update(
+        {"_id": ObjectId(current_user)},
+        {"$addToSet": {"searched_titles": {"$each": titles}}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER
     )
 
-    if result.modified_count > 0:
-        return jsonify({"message": "Titles added successfully"}), 200
+    if any(title in updated_document['searched_titles'] for title in titles):
+        return jsonify({"message": "Titles added or already existed"}), 200
     else:
         return jsonify({"message": "Failed to add titles"}), 500
     
@@ -100,12 +107,15 @@ def get_titles():
     # Find the user document using the current_user ID
     user = collection.find_one({"_id": ObjectId(current_user)})
     
-    # Check if the user document has the 'searched_titles' field
     if user and 'searched_titles' in user:
-        return jsonify({"titles": user['searched_titles']}), 200
+        titles_with_contents = [
+            {"title": entry["title"], "summary": entry["summary"]} 
+            for entry in user['searched_titles']
+        ]
+        return jsonify({"searched_titles": titles_with_contents}), 200
     elif user:
         # The user exists but has no titles added yet
-        return jsonify({"titles": []}), 200
+        return jsonify({"searched_titles": []}), 200
     else:
         # User document not found
         return jsonify({"message": "User not found"}), 404
@@ -143,8 +153,9 @@ def get_wikipedia_content():
     if page.exists():
         content = page.text
     else:
-        print(f"The page '{page_title}' does not exist on Wikipedia!")
-        
+        #print(f"The page '{page_title}' does not exist on Wikipedia!")
+        return jsonify({"message": "The page does not exist on English Wikipedia."}), 404
+    
     # Pas 2: Parsare paragrafe in propozitii folosin Google Cloud Natural Language API
     with open(os.getenv("API_KEY_PATH"), "r") as json_file:
         api_key_data = json.load(json_file)
@@ -176,11 +187,57 @@ def get_wikipedia_content():
     
     return jsonify(result) #return resul of an array of phrases
 
+def make_summarization(text):
+    doc = nlp(text)
+
+    STOP_WORDS = set(text.split())
+    word_weights={}
+
+    for entity in doc.ents:
+        entity_text = entity.text.lower()
+        if entity_text in word_weights:
+            word_weights[entity_text] += 1
+        else:
+            word_weights[entity_text] = 1
+
+    for word in word_tokenize(text):
+        word = word.lower()
+        
+        if len(word) > 1 and word not in STOP_WORDS:
+            if word in word_weights.keys():            
+                word_weights[word] += 1
+            else:
+                word_weights[word] = 1
+
+    sentence_weights={}
+    sentences = tokenize.sent_tokenize(text)
+    nr_sent = int(len(sentences) / 3)
+    
+    for sent in sentences:
+        sentence_weights[sent] = 0
+        sent_words = word_tokenize(sent)
+        sent_entities = [ent.text.lower() for ent in doc.ents]
+        for word in sent_words:
+            word = word.lower()
+            if word in word_weights:
+                sentence_weights[sent] += word_weights[word]
+            if word in sent_entities:
+                sentence_weights[sent] += 1
+    
+    highest_weights = sorted(sentence_weights.values())[-nr_sent:]
+    summary = ""
+    
+    for sentence, strength in sentence_weights.items():  
+        if strength in highest_weights:
+            summary += sentence + " "
+            
+    summary = summary.replace('_', ' ').strip()
+    
+    return summary
 
 @app.route('/getSummary', methods=['GET'])
 @jwt_required()
-def get_wikipedia_summary(): #ar merge o sumarizare extractiva aici
-    # Pas 1: Extragere continut articol de pe Wikipedia
+def get_wikipedia_summary(): 
     page_title = request.args.get('page_title')
 
     wiki_wiki = wikipediaapi.Wikipedia(
@@ -190,39 +247,46 @@ def get_wikipedia_summary(): #ar merge o sumarizare extractiva aici
     page = wiki_wiki.page(page_title)
     if page.exists():
         content = page.text
+        summary = make_summarization(content)
     else:
-        print(f"The page '{page_title}' does not exist on Wikipedia!")
+       return jsonify({"message": "The page does not exist on English Wikipedia."}), 404
         
-    # Pas 2: Parsare paragrafe in propozitii folosin Google Cloud Natural Language API
     with open(os.getenv("API_KEY_PATH"), "r") as json_file:
         api_key_data = json.load(json_file)
 
-    client = language_v1.LanguageServiceClient.from_service_account_info(
-    api_key_data)
-
-    document = language_v1.Document(
-    content=content, type_=language_v1.Document.Type.PLAIN_TEXT)
-
+    client = language_v1.LanguageServiceClient.from_service_account_info(api_key_data)
+    document = language_v1.Document(content=summary, type_=language_v1.Document.Type.PLAIN_TEXT)
     features = {"extract_syntax": True, "extract_entities": False,
                 "extract_document_sentiment": False, "extract_entity_sentiment": False, "classify_text": False}
 
     response = client.annotate_text(document=document, features=features)
-
-    #sentences = [sentence.text.content.strip() for sentence in response.sentences if re.match(r'^[A-Z].*\.$', sentence.text.content)]
     sentences = [sentence.text.content.strip() for sentence in response.sentences if re.match(r'^[A-Z].*\s[A-Za-z0-9]{2,}\.$', sentence.text.content)]
-
+        
     result = []
-    sentence_count = 0
+    current_chunk = []
     
-    # Pas 3: Alegerea primelor 6 prop din fiecare paragraf
     for sentence in sentences:
-        if sentence_count < 10:
-            result.append(sentence)
-            sentence_count += 1
-        else:
-            break  # Stop the loop if we've added 10 sentences
+        current_chunk.append(sentence)
+        if len(current_chunk) == 3:
+            result.append(' '.join(current_chunk))
+            current_chunk = []
+            result.append('\n') # add \n after 3 sentences
+
+    if current_chunk:
+        result.append(' '.join(current_chunk))
+
+    final_result = ''.join(result)
     
-    return jsonify(result) 
+    #add in the mongo the title with its content
+    current_user = get_jwt_identity()
+    updated_document = collection.find_one_and_update(
+        {"_id": ObjectId(current_user)},
+        {"$addToSet": {"searched_titles": {"title": page_title, "summary": final_result}}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER
+    )
+
+    return jsonify(final_result) 
 
 @app.route('/deleteTitle', methods=['POST'])
 @jwt_required()
@@ -234,16 +298,15 @@ def delete_title():
     if not title_to_delete:
         return jsonify({"error": "Title is required"}), 400
 
-    # Assuming your user's document contains a field 'searched_titles' which is a list of titles
     result = collection.update_one(
-        {"_id": ObjectId(current_user_id)},
-        {"$pull": {"searched_titles": title_to_delete}}  # $pull operator removes from an existing array all instances of a value or values that match a specified condition
-    )
+            {"_id": ObjectId(current_user_id)},
+            {"$pull": {"searched_titles": {"title": title_to_delete}}}
+        )
+
 
     if result.modified_count > 0:
         return jsonify({"message": "Title deleted successfully"}), 200
     else:
-        # This could happen if the title wasn't in the user's list or the user document couldn't be found
         return jsonify({"error": "Failed to delete title"}), 500
 
 
